@@ -29,8 +29,8 @@ logging.basicConfig(level=logging.DEBUG)
 
 if use_lrabr:
 
-    skip_between_every = 0
-    total_to_use = 1000
+    skip_between_every = 4
+    total_to_use = 90000
     # todo: free up enough memory to do all of them? right now it doesn't do longform duplicates, and quits after a few
     used_longs = set()
     string_longs = []
@@ -145,7 +145,7 @@ for i in range(len(string_longs)):
 logging.info('built one-hot feature vectors.')
 
 batch_counter = 0
-batch_size = 100
+batch_size = 1000
 
 class Align:
 
