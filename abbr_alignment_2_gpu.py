@@ -8,12 +8,15 @@ import editdistance
 __author__ = 'gpfinley'
 
 
+# TODO: show progress on held-out set during training
+
+
 """
 
 Learn to map phrases to their abbreviations
 
 
-Better code for GPU (load all values in dense format onto gpu)
+Better code all around, and especially for GPU (load all values in dense format onto gpu)
 
 
 some notes from implementation:
@@ -30,15 +33,18 @@ scrub_abbr_periods = True
 case_sensitive = True
 acronyms_only = True
 batch_size = 100
-lr =.00003
+lr =.00001
+held_out_frac = .1
+use_lstm = False
+print globals()
 
 
 logging.basicConfig(level=logging.DEBUG)
 
 if use_lrabr:
 
-    skip_between_every = 4
-    total_to_use = 90000
+    skip_between_every = 0
+    total_to_use = 100000
     # todo: free up enough memory to do all of them? right now it doesn't do longform duplicates, and quits after a few
     used_longs = set()
     string_longs = []
@@ -133,6 +139,23 @@ for i in range(len(string_longs)):
 X_lengths = np.array([len(x) for x in string_longs])
 
 
+# create held-out set
+
+begin_held_out = int(len(X) * (1-held_out_frac))
+held_out_X = X[begin_held_out:, :]
+X = X[:begin_held_out, :]
+held_out_y = y[begin_held_out:, :]
+y = y[:begin_held_out, :]
+held_out_X_lengths = X_lengths[begin_held_out:]
+X_lengths = X_lengths[:begin_held_out]
+held_string_longs = string_longs[begin_held_out:]
+string_longs = string_longs[:begin_held_out]
+held_string_abbrs = string_abbrs[begin_held_out:]
+string_abbrs = string_abbrs[:begin_held_out]
+logging.info('created held out set')
+
+
+
 
 
 batch_counter = 0
@@ -172,13 +195,10 @@ def hypothesis_to_readable(hypothesis):
 
 num_iter = 800000
 
-costs_file = open('costs.txt', 'w')
-
 with tf.Graph().as_default():
 
     rnn_size = 2 * nchar
 
-    # TODO: change these placeholders to straight-up variables that contain all the data
     all_input_lengths = tf.constant(X_lengths, dtype=tf.int32)
     all_dense_inputs = tf.constant(X, dtype=tf.int32)
     all_dense_outputs = tf.constant(y, dtype=tf.int32)
@@ -202,14 +222,17 @@ with tf.Graph().as_default():
     labels = tf.SparseTensor(indices=output_indices, values=output_chars, shape=[batch_size, maxlen])
     labels = tf.to_int32(labels)
 
-    # lstm_cell = tf.nn.rnn_cell.LSTMCell(rnn_size, forget_bias=1., state_is_tuple=True)
-    lstm_cell = tf.nn.rnn_cell.BasicRNNCell(rnn_size)
+    if use_lstm:
+        lstm_cell = tf.nn.rnn_cell.LSTMCell(rnn_size, forget_bias=1., state_is_tuple=True)
+    else:
+        lstm_cell = tf.nn.rnn_cell.BasicRNNCell(rnn_size)
 
-    initial_state = lstm_cell.zero_state(batch_size, tf.float32)
+    # initial_state = lstm_cell.zero_state(batch_size, tf.float32)
 
     # split up inputs to use for basic rnn function (batch represented as a list of vectors)
     inputs_list = tf.unstack(inputs, axis=1)
-    lstm_outputs_timefirst, state = tf.nn.rnn(lstm_cell, inputs_list, sequence_length=input_lengths, initial_state=initial_state)
+    with tf.variable_scope('Rnn'):
+        lstm_outputs_timefirst, state = tf.nn.rnn(lstm_cell, inputs_list, sequence_length=input_lengths, dtype=tf.float32) #initial_state=initial_state)
 
     # reorder these (want batch_size * maxlen * len(all_chars))
     lstm_outputs = tf.transpose(lstm_outputs_timefirst, perm=[1,0,2])
@@ -243,6 +266,40 @@ with tf.Graph().as_default():
 
 
 
+    # FOR HELD OUT SET
+
+    held_input_lengths = tf.constant(held_out_X_lengths, dtype=tf.int32)
+    held_dense_inputs = tf.constant(held_out_X, dtype=tf.int32)
+    held_dense_outputs = tf.constant(held_out_y, dtype=tf.int32)
+
+    held_inputs = tf.one_hot(held_dense_inputs, nchar)
+
+    held_output_indices, held_output_chars = dense_to_sparse_args(held_dense_outputs)
+
+    held_labels = tf.SparseTensor(indices=held_output_indices, values=held_output_chars, shape=[len(held_out_X_lengths), maxlen])
+    held_labels = tf.to_int32(held_labels)
+
+    # TODO: verify that this uses the same lstm cell as the training data
+    # split up inputs to use for basic rnn function (batch represented as a list of vectors)
+    held_inputs_list = tf.unstack(held_inputs, axis=1)
+    with tf.variable_scope('Rnn', reuse=True):
+        held_lstm_outputs_timefirst, _ = tf.nn.rnn(lstm_cell, held_inputs_list, sequence_length=held_input_lengths, dtype=tf.float32)
+
+    # reorder these (want batch_size * maxlen * len(all_chars))
+    held_lstm_outputs = tf.transpose(held_lstm_outputs_timefirst, perm=[1,0,2])
+
+    held_output_layer = tf.einsum('abi,ic->abc', held_lstm_outputs, W) + b
+    held_cost = tf.nn.ctc_loss(held_output_layer, held_labels, held_input_lengths, ctc_merge_repeated=False, time_major=False)
+
+    if use_house_decoder:
+        held_hypotheses = tf.arg_max(held_output_layer, 2)
+    else:
+        # can also decode with this, although it makes it harder to see the output at each time
+        held_hypotheses = tf.nn.ctc_greedy_decoder(tf.transpose(held_output_layer, perm=[1,0,2]),
+                                                        [maxlen] * len(held_out_X_lengths),
+                                                        merge_repeated=False)
+
+
 
 
 
@@ -250,23 +307,32 @@ with tf.Graph().as_default():
 
     with tf.Session() as session:
         session.run(tf.global_variables_initializer())
+
+        costs_file = open('costs.txt', 'w')
+        dev_file = open('dev_log.txt', 'w')
+
         for iternum in range(num_iter):
+
+            print iternum
 
             next_batch_begin = get_next_batch()
 
             feed_dict={batch_begin : [next_batch_begin]}
 
-            thiscost, state, _, hypothesis = session.run([cost, latest_state, train_op, char_hypotheses],
-                                                     feed_dict=feed_dict)
+            thiscost, state, _, train_hypothesis = session.run([cost,
+                                                                 latest_state,
+                                                                 train_op,
+                                                                 char_hypotheses],
+                                                                 feed_dict=feed_dict)
 
-            print 'costs', thiscost
+            # print 'costs', thiscost
             mean_cost = sum(thiscost) / batch_size
-            print 'mean cost', mean_cost
+            print 'mean training cost', mean_cost
             costs_file.write(str(mean_cost) + '\n')
             if iternum % 10 == 0:
                 costs_file.flush()
 
-            readable_hypotheses = hypothesis_to_readable(hypothesis)
+            readable_hypotheses = hypothesis_to_readable(train_hypothesis)
 
             # edit_dist_hypotheses = [x.replace('_','') for x in readable_hypotheses]
             # edits = [editdistance.eval(hyp, gold) for (hyp, gold) in zip(edit_dist_hypotheses, stringabbrs)]
@@ -276,3 +342,25 @@ with tf.Graph().as_default():
                       string_abbrs[next_batch_begin:next_batch_begin+batch_size],
                       readable_hypotheses)
 
+            if iternum % 100 == 0:
+                held_cost_run, held_hypothesis_run = session.run([held_cost, held_hypotheses])
+                mean_dev_cost = sum(held_cost_run) / len(held_cost_run)
+                print 'mean dev cost', mean_dev_cost
+                dev_file.write(str(mean_dev_cost) + '\n')
+                dev_file.write(str(zip(held_string_longs,
+                                   held_string_abbrs,
+                                   readable_hypotheses)))
+                dev_file.write('\n')
+                dev_file.flush()
+
+
+                readable_hypotheses = hypothesis_to_readable(held_hypothesis_run)
+
+                print_first_x = 100
+                print zip(held_string_longs[:print_first_x],
+                          held_string_abbrs[:print_first_x],
+                          readable_hypotheses[:print_first_x])
+
+    # todo: save model parameters somehow and enable decoding
+    costs_file.close()
+    dev_file.close()
