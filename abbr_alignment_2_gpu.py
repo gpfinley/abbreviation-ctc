@@ -26,16 +26,18 @@ some notes from implementation:
 
 """
 
-use_lrabr = True
+use_lrabr = 1
 EMPTY = '_'
-use_house_decoder = True
-scrub_abbr_periods = True
-case_sensitive = True
-acronyms_only = True
+use_house_decoder = 1
+scrub_abbr_periods = 1
+case_sensitive = 1
+acronyms_only = 1
 batch_size = 100
 lr =.00001
-held_out_frac = .1
-use_lstm = False
+held_out_frac = .2
+use_lstm = 1
+bidirectional = 1
+num_iter = 1000000
 print globals()
 
 
@@ -45,28 +47,30 @@ if use_lrabr:
 
     skip_between_every = 0
     total_to_use = 100000
-    # todo: free up enough memory to do all of them? right now it doesn't do longform duplicates, and quits after a few
-    used_longs = set()
+    used_euis = set()
     string_longs = []
     string_abbrs = []
     # with open('/Volumes/gregdata/metathesaurus/2015AA/LEX/LRABR') as f:
-    with open('/Users/gpfinley/LRABR') as f:
+    with open('LRABR') as f:
         used = 0
         skipcounter = 0
         for line in f:
-            _, abbr, type, _, long, _ = line.split('|')
+            abbreui, abbr, type, longeui, long, _ = line.split('|')
+            if longeui in used_euis or abbreui in used_euis: continue
             if acronyms_only and type != 'acronym':
                 continue
             if skipcounter:
                 skipcounter -= 1
                 continue
+
+            used_euis.add(longeui)
+            used_euis.add(abbreui)
             if scrub_abbr_periods:
                 abbr = abbr.replace('.', '')
             if not case_sensitive:
                 abbr = abbr.lower()
                 long = long.lower()
-            if long not in used_longs and len(long) > len(abbr):
-                used_longs.add(long)
+            if len(long) > len(abbr):
                 string_longs.append(long)
                 string_abbrs.append(abbr)
                 used += 1
@@ -81,6 +85,8 @@ if use_lrabr:
     random.shuffle(string_abbrs)
     logging.info('shuffled abbrs')
 
+
+    print len(string_longs), 'total pairs'
 
 
 else:
@@ -141,7 +147,7 @@ X_lengths = np.array([len(x) for x in string_longs])
 
 # create held-out set
 
-begin_held_out = int(len(X) * (1-held_out_frac))
+begin_held_out = int(len(string_longs) * (1-held_out_frac))
 held_out_X = X[begin_held_out:, :]
 X = X[:begin_held_out, :]
 held_out_y = y[begin_held_out:, :]
@@ -193,7 +199,6 @@ def hypothesis_to_readable(hypothesis):
 
 
 
-num_iter = 800000
 
 with tf.Graph().as_default():
 
@@ -223,21 +228,37 @@ with tf.Graph().as_default():
     labels = tf.to_int32(labels)
 
     if use_lstm:
-        lstm_cell = tf.nn.rnn_cell.LSTMCell(rnn_size, forget_bias=1., state_is_tuple=True)
+        if bidirectional:
+            lstm_cell_1 = tf.nn.rnn_cell.LSTMCell(rnn_size, forget_bias=1., state_is_tuple=True)
+            lstm_cell_2 = tf.nn.rnn_cell.LSTMCell(rnn_size, forget_bias=1., state_is_tuple=True)
+        else:
+            lstm_cell = tf.nn.rnn_cell.LSTMCell(rnn_size, forget_bias=1., state_is_tuple=True)
     else:
-        lstm_cell = tf.nn.rnn_cell.BasicRNNCell(rnn_size)
+        if bidirectional:
+            lstm_cell_1 = tf.nn.rnn_cell.BasicRNNCell(rnn_size)
+            lstm_cell_2 = tf.nn.rnn_cell.BasicRNNCell(rnn_size)
+        else:
+            lstm_cell = tf.nn.rnn_cell.BasicRNNCell(rnn_size)
 
     # initial_state = lstm_cell.zero_state(batch_size, tf.float32)
 
     # split up inputs to use for basic rnn function (batch represented as a list of vectors)
     inputs_list = tf.unstack(inputs, axis=1)
-    with tf.variable_scope('Rnn'):
-        lstm_outputs_timefirst, state = tf.nn.rnn(lstm_cell, inputs_list, sequence_length=input_lengths, dtype=tf.float32) #initial_state=initial_state)
 
+    with tf.variable_scope('Rnn'):
+        # lstm_outputs_timefirst, state = tf.nn.rnn(lstm_cell, inputs_list, sequence_length=input_lengths, dtype=tf.float32) #initial_state=initial_state)
+        if bidirectional:
+            lstm_outputs_timefirst, state, statebackward = tf.nn.bidirectional_rnn(lstm_cell_1, lstm_cell_2, inputs_list, sequence_length=input_lengths, dtype=tf.float32)
+        else:
+            lstm_outputs_timefirst, state = tf.nn.rnn(lstm_cell, inputs_list, sequence_length=input_lengths, dtype=tf.float32)
     # reorder these (want batch_size * maxlen * len(all_chars))
     lstm_outputs = tf.transpose(lstm_outputs_timefirst, perm=[1,0,2])
 
-    W = tf.Variable(np.random.random(size=(rnn_size, len(all_chars))), dtype=tf.float32)
+    if bidirectional:
+        W_size = rnn_size * 2
+    else:
+        W_size = rnn_size
+    W = tf.Variable(np.random.random(size=(W_size, len(all_chars))), dtype=tf.float32)
     b_array = np.zeros(len(all_chars), dtype=np.float32)
     # build in a little initial bias towards null (hopefully speeds up training)
     b_array[-1] = .1
@@ -279,11 +300,13 @@ with tf.Graph().as_default():
     held_labels = tf.SparseTensor(indices=held_output_indices, values=held_output_chars, shape=[len(held_out_X_lengths), maxlen])
     held_labels = tf.to_int32(held_labels)
 
-    # TODO: verify that this uses the same lstm cell as the training data
     # split up inputs to use for basic rnn function (batch represented as a list of vectors)
     held_inputs_list = tf.unstack(held_inputs, axis=1)
     with tf.variable_scope('Rnn', reuse=True):
-        held_lstm_outputs_timefirst, _ = tf.nn.rnn(lstm_cell, held_inputs_list, sequence_length=held_input_lengths, dtype=tf.float32)
+        if bidirectional:
+            held_lstm_outputs_timefirst, _, _ = tf.nn.bidirectional_rnn(lstm_cell_1, lstm_cell_2, held_inputs_list, sequence_length=held_input_lengths, dtype=tf.float32)
+        else:
+            held_lstm_outputs_timefirst, _ = tf.nn.rnn(lstm_cell, held_inputs_list, sequence_length=held_input_lengths, dtype=tf.float32)
 
     # reorder these (want batch_size * maxlen * len(all_chars))
     held_lstm_outputs = tf.transpose(held_lstm_outputs_timefirst, perm=[1,0,2])
@@ -332,34 +355,36 @@ with tf.Graph().as_default():
             if iternum % 10 == 0:
                 costs_file.flush()
 
-            readable_hypotheses = hypothesis_to_readable(train_hypothesis)
-
             # edit_dist_hypotheses = [x.replace('_','') for x in readable_hypotheses]
             # edits = [editdistance.eval(hyp, gold) for (hyp, gold) in zip(edit_dist_hypotheses, stringabbrs)]
             # print 'mean edit dist', sum(edits) / batch_size
 
-            print zip(string_longs[next_batch_begin:next_batch_begin+batch_size],
-                      string_abbrs[next_batch_begin:next_batch_begin+batch_size],
-                      readable_hypotheses)
 
             if iternum % 100 == 0:
+                readable_hypotheses = hypothesis_to_readable(train_hypothesis)
+                print zip(string_longs[next_batch_begin:next_batch_begin+batch_size],
+                          string_abbrs[next_batch_begin:next_batch_begin+batch_size],
+                          readable_hypotheses)
+
+
                 held_cost_run, held_hypothesis_run = session.run([held_cost, held_hypotheses])
+                held_readable_hypotheses = hypothesis_to_readable(held_hypothesis_run)
+
                 mean_dev_cost = sum(held_cost_run) / len(held_cost_run)
                 print 'mean dev cost', mean_dev_cost
                 dev_file.write(str(mean_dev_cost) + '\n')
                 dev_file.write(str(zip(held_string_longs,
                                    held_string_abbrs,
-                                   readable_hypotheses)))
+                                   held_readable_hypotheses)))
                 dev_file.write('\n')
                 dev_file.flush()
 
 
-                readable_hypotheses = hypothesis_to_readable(held_hypothesis_run)
 
                 print_first_x = 100
                 print zip(held_string_longs[:print_first_x],
                           held_string_abbrs[:print_first_x],
-                          readable_hypotheses[:print_first_x])
+                          held_readable_hypotheses[:print_first_x])
 
     # todo: save model parameters somehow and enable decoding
     costs_file.close()
